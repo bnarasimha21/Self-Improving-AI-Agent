@@ -1,34 +1,21 @@
-"""
-Self-improving agent using DigitalOcean Gradient SDK for both task LLM and meta-LLM.
-
-Requirements:
-  pip install gradient
-  export GRADIENT_MODEL_ACCESS_KEY="..."     # required
-  optionally: export GRADIENT_AGENT_ACCESS_KEY and GRADIENT_AGENT_ENDPOINT
-
-Docs reference: DigitalOcean gradient-python README (usage examples).
-"""
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, TypedDict, Any
 from gradient import Gradient
 from dotenv import load_dotenv
+from langgraph.graph import StateGraph, END
 
 load_dotenv()
 
-# === CONFIG ===
 MODEL_TASK = os.getenv("MODEL_TASK", "llama3.3-70b-instruct")   # model for market research
 MODEL_META = os.getenv("MODEL_META", "llama3.3-70b-instruct")   # model used as meta-LLM to rewrite prompts
 MAX_ITERS = 4
 
-# === Init clients ===
 MODEL_ACCESS_KEY = os.getenv("GRADIENT_MODEL_ACCESS_KEY")
 if not MODEL_ACCESS_KEY:
     raise RuntimeError("Set GRADIENT_MODEL_ACCESS_KEY environment variable")
 
-# Use the Gradient client for inference
 inference_client = Gradient(model_access_key=MODEL_ACCESS_KEY)
 
-# === Quality rubric ===
 REQUIRED_SECTIONS = [
     "Top 3 trends",
     "Competitor analysis",
@@ -36,13 +23,7 @@ REQUIRED_SECTIONS = [
     "Sources",
 ]
 
-# === Task LLM call (Gradient) ===
 def task_llm_call_gradient(prompt: str, model: str = MODEL_TASK, temperature: float = 0.2, max_tokens: int = 700) -> str:
-    """
-    Calls Gradient's serverless inference chat completion API.
-    Returns text content from the first choice.
-    """
-    # The SDK exposes: inference_client.chat.completions.create(...)
     resp = inference_client.chat.completions.create(
         messages=[
             {"role": "system", "content": "You are a helpful market-research assistant."},
@@ -63,11 +44,7 @@ def task_llm_call_gradient(prompt: str, model: str = MODEL_TASK, temperature: fl
                 return c.text
         return str(resp)
 
-# === Meta LLM: use Gradient to rewrite prompt automatically ===
 def meta_rewrite_prompt_gradient(original_prompt: str, response: str, checks: Dict[str, bool], model: str = MODEL_META) -> str:
-    """
-    Use a model to rewrite the prompt. We instruct the model to return only the improved prompt.
-    """
     failed = [k for k, ok in checks.items() if not ok]
     instruction = (
         "You are a prompt-writing assistant. The ORIGINAL_PROMPT and RESPONSE are below.\n\n"
@@ -100,7 +77,6 @@ def meta_rewrite_prompt_gradient(original_prompt: str, response: str, checks: Di
         # fallback
         return str(resp).strip()
 
-# === Quality checker ===
 def quality_check(response: str) -> Tuple[bool, Dict[str, bool]]:
     lower = response.lower()
     checks = {}
@@ -111,44 +87,56 @@ def quality_check(response: str) -> Tuple[bool, Dict[str, bool]]:
     success = all(checks.values())
     return success, checks
 
-# === Main loop ===
-def self_improving_loop(initial_prompt: str, max_iters: int = MAX_ITERS):
-    prompt = initial_prompt
-    last_response = ""
-    for i in range(1, max_iters + 1):
-        print(f"\n--- Iteration {i} — sending prompt to task LLM ---\n")
-        print(prompt)
-        response = task_llm_call_gradient(prompt)
-        print(f"\n--- Task LLM response (iteration {i}) ---\n")
-        print(response[:3000])
+class AgentState(TypedDict):
+    prompt: str
+    response: str
+    checks: Dict[str, bool]
+    iterations: int
 
-        ok, checks = quality_check(response)
-        print(f"\nQuality checks: {checks}\n")
-        last_response = response
-        if ok:
-            print("Response accepted by quality checker.")
-            return {"response": response, "iterations": i, "checks": checks}
+def generate_node(state: AgentState) -> AgentState:
+    response = task_llm_call_gradient(state['prompt'])
+    ok, checks = quality_check(response)
+    
+    return {
+        "response": response,
+        "checks": checks,
+        "iterations": state['iterations'] + 1
+    }
 
-        # Not ok -> use meta model to rewrite prompt
-        print("Calling meta model to rewrite prompt based on failed checks...")
-        improved = meta_rewrite_prompt_gradient(prompt, response, checks)
-        print("\n--- Meta-improved prompt ---\n")
-        print(improved)
-        # Use the improved prompt next iteration
-        prompt = improved
+def rewrite_node(state: AgentState) -> AgentState:
+    improved = meta_rewrite_prompt_gradient(state['prompt'], state['response'], state['checks'])
+    return {"prompt": improved}
 
-    print("Max iterations reached; returning last response (may be incomplete).")
-    return {"response": last_response, "iterations": max_iters, "checks": checks}
+def check_quality_edge(state: AgentState) -> str:
+    if all(state['checks'].values()):
+        return END
+    if state['iterations'] >= MAX_ITERS:
+        return END
+    return "rewrite"
 
-# === Demo run ===
+workflow = StateGraph(AgentState)
+workflow.add_node("generate", generate_node)
+workflow.add_node("rewrite", rewrite_node)
+
+workflow.set_entry_point("generate")
+workflow.add_conditional_edges("generate", check_quality_edge)
+workflow.add_edge("rewrite", "generate")
+
+app = workflow.compile()
+
 if __name__ == "__main__":
     starting_prompt = (
         "Market Research: Write a market research brief for entering the North American smart-wearables market.\n"
         "Make it useful for a Product Manager."
     )
-    result = self_improving_loop(starting_prompt, max_iters=4)
-    print("\n\n===== FINAL OUTPUT =====\n")
+    
+    initial_state = {
+        "prompt": starting_prompt,
+        "iterations": 0,
+        "response": "",
+        "checks": {}
+    }
+    
+    result = app.invoke(initial_state)
+    
     print(result["response"])
-    print("\n===== METADATA =====")
-    print("Iterations used:", result["iterations"])
-    print("Final checks:", result["checks"])
